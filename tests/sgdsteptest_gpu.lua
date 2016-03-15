@@ -1,5 +1,5 @@
 require('torch')
-require('net')
+require('../net')
 require('cunn')
 require('cutorch')
 --require('cudnn')

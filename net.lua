@@ -5,8 +5,22 @@ net = {}
 
 require('graph')
 require('nngraph')
+require('hdf5')
 local config = require('pl.config')
 local utils = require('pl.utils')
+
+--[[
+DataProvider = torch.class('net.DataProvider')
+
+function DataProvider:__init(hdf5source, sourcelist, subslice)
+    self.hdf5source = hdf5source
+    self.sourcelist = sourcelist
+    self.subslice = subslice
+
+    self.hdf5 = hdf5.open(self.hdf5source)
+    
+end
+--]]
 
 function getnode(G, x)
     nodes = G.nodes
@@ -98,12 +112,30 @@ function net.loadnet(filename)
     return N, rootnames, leafnames, G, steplist, stepspecs
 end
 
-
 --[[
-function net.train(N, nbatches, inputPatternMap, outputPatternMap, stepspecs, prevs, momentum, learning_rate, weight_decay, save_frequency)
-    
+function net.trainSGDMultiObjective()
+    -- set seed
+    -- load net from .t7 if given else from .ini
+    -- set epoch and batch from loaded model or else at 0
+    -- initialize data provider to batch_num
+    -- loop stepSGDMultiObjective for given number of numbers 
+    -- save in specified way with specified frequency
 end
 --]]
+
+function net.stepSGDMultiObjective(N, inputPatterns, outputPatterns, 
+	           		    stepspecs, prevs, momentum, learning_rate, 
+				    weight_decay)
+    --inputPatterns = table of data providers returning object suitable for network intput
+    --outputPatterns = table of outputGrad (tables of tensors or single tensors)
+    for j=1,#inputPatterns do
+        if not prevs[j] then prevs[j] = {} end
+	inputs = inputPatterns[j]: getNextBatch()
+	outputGrads = outputPatterns[j]
+	net.sgdstep(N, inputs, outputGrads, stepspecs, prevs[j], momentum, learning_rate, weight_decay)
+    end
+end
+
 
 function net.sgdstep(N, inputs, outputGrads, stepspecs, prevs, momentum, learning_rate, weight_decay)
     t0 = os.clock()
