@@ -45,21 +45,25 @@ function HDF5DataProvider:getNextBatch()
     data = {}
     cbn = self.curr_batch_num
     startv = cbn * self.batch_size + 1
-    endv = math.max((cbn + 1) * self.batch_size, self.data_length)
+    endv = math.min((cbn + 1) * self.batch_size, self.data_length)
+    sourcelist = self.sourcelist
     for sourceind=1,#sourcelist do 
         source = sourcelist[sourceind]
     	slice = tablex.deepcopy(self.sizes[source])
 	table.remove(slice, 1)
-        table.insert(slice, 1, {start, endv})
+        table.insert(slice, 1, {startv, endv})
+	for sind=2,#slice do
+	    slice[sind] = {1, slice[sind]}
+	end
         data[source] = self.data[source]:partial(unpack(slice))
     end
-    self.incrementBatchNum()
+    self:incrementBatchNum()
     return data
 end
 
 
 function HDF5DataProvider:incrementBatchNum()
-    m = self.num_total_batches
+    m = self.total_batches
     self.curr_batch_num = (self.curr_batch_num + 1) % m
 end
 
