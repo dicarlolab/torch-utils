@@ -8,19 +8,61 @@ require('nngraph')
 require('hdf5')
 local config = require('pl.config')
 local utils = require('pl.utils')
+local tablex = require('pl.tablex')
 
---[[
-DataProvider = torch.class('net.DataProvider')
+--[[HDF5 todo:  
+    - debug: current code
+    - add: subslice
+--]]
 
-function DataProvider:__init(hdf5source, sourcelist, subslice)
+HDF5DataProvider = torch.class('net.HDF5DataProvider')
+function HDF5DataProvider:__init(hdf5source, sourcelist, batch_size)
     self.hdf5source = hdf5source
     self.sourcelist = sourcelist
-    self.subslice = subslice
-
-    self.hdf5 = hdf5.open(self.hdf5source)
-    
+    --self.subslice = subslice
+    self.file = hdf5.open(self.hdf5source, 'r')
+    self.data = {}
+    self.sizes = {}
+    for sourceind=1,#sourcelist do
+        source = sourcelist[sourceind]
+    	self.data[source] = self.file:read(source)
+	self.sizes[source] = self.data[source]:dataspaceSize()
+	if not self.data_length then self.data_length = self.sizes[source][1] end
+	assert (self.sizes[source][1] == self.data_length, self.sizes[source], self.data_length)
+    end
+    self.batch_size = batch_size
+    self.total_batches = math.ceil(self.data_length / self.batch_size)
+    self.curr_batch_num = 0
 end
---]]
+
+
+function HDF5DataProvider:setBatchNum(n)
+    self.curr_batch_num = n
+end
+
+
+function HDF5DataProvider:getNextBatch()
+    data = {}
+    cbn = self.curr_batch_num
+    startv = cbn * self.batch_size + 1
+    endv = math.max((cbn + 1) * self.batch_size, self.data_length)
+    for sourceind=1,#sourcelist do 
+        source = sourcelist[sourceind]
+    	slice = tablex.deepcopy(self.sizes[source])
+	table.remove(slice, 1)
+        table.insert(slice, 1, {start, endv})
+        data[source] = self.data[source]:partial(unpack(slice))
+    end
+    self.incrementBatchNum()
+    return data
+end
+
+
+function HDF5DataProvider:incrementBatchNum()
+    m = self.num_total_batches
+    self.curr_batch_num = (self.curr_batch_num + 1) % m
+end
+
 
 function getnode(G, x)
     nodes = G.nodes
