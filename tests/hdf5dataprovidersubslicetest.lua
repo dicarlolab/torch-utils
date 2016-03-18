@@ -1,7 +1,10 @@
 require("../net")
 
-func = function(x, y) return torch.ge(x[y[2]]:all(), 5)   end
-dp = net.HDF5DataProvider("./test.h5", {"data", "labels"}, 10, func)
+func = function(x, y) return torch.ge(x:read(y[2]):all(), 5)   end
+dp = net.HDF5DataProvider({hdf5source="./test.h5", 
+                           sourcelist={"data", "labels"}, 
+                           batch_size=10, 
+			   subslice=func})
 
 assert(dp.total_batches == 18)
 assert(dp.data_length == 176)

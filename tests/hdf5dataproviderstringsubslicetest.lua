@@ -1,6 +1,9 @@
 require("../net")
 
-dp = net.HDF5DataProvider("./test.h5", {"data", "labels"}, 10, 'subslice')
+dp = net.HDF5DataProvider({hdf5source="./test.h5", 
+			   sourcelist={"data", "labels"}, 
+			   batch_size=10, 
+			   subslice='subslice'})
 
 assert(dp.total_batches == 13)
 assert(dp.data_length == 129)

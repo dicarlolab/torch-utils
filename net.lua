@@ -10,20 +10,23 @@ local config = require('pl.config')
 local utils = require('pl.utils')
 local tablex = require('pl.tablex')
 
---[[HDF5 todo:  
-    - add: subslice
---]]
 
 HDF5DataProvider = torch.class('net.HDF5DataProvider')
-function HDF5DataProvider:__init(hdf5source, sourcelist, batch_size, subslice)
+function HDF5DataProvider:__init(args)
+    hdf5source = args['hdf5source']
+    sourcelist = args['sourcelist']
+    batch_size = args['batch_size']
+    subslice = args['subslice']
+    postprocess = args['postprocess']
     self.hdf5source = hdf5source
     self.sourcelist = sourcelist
     self.file = hdf5.open(self.hdf5source, 'r')
     self.subslice = subslice
+    self.postprocess = postprocess
     self.data = {}
     self.sizes = {}
     for sourceind=1,#sourcelist do
-        source = sourcelist[sourceind]
+        local source = sourcelist[sourceind]
     	self.data[source] = self.file:read(source)
     end
     for sourceind=1,#sourcelist do
@@ -33,16 +36,16 @@ function HDF5DataProvider:__init(hdf5source, sourcelist, batch_size, subslice)
 	else
 	    if not self.subsliceinds then
 	        if type(self.subslice) == 'function' then
-    	            self.subsliceinds = self.subslice(self.data, self.sourcelist)
+    	            self.subsliceinds = self.subslice(self.file, self.sourcelist)
 		else
 		    assert(type(self.subslice) == 'string')
 		    self.subsliceinds = self.file:read(self.subslice):all()
 		end
-		ssnz = self.subsliceinds:nonzero()
+		local ssnz = self.subsliceinds:nonzero()
 		ssnz = ssnz:reshape(torch.LongStorage({ssnz:size(1)}))
 		self.subsliceindsnz = ssnz
 	    end
-            sz = self.data[source]:dataspaceSize()
+            local sz = self.data[source]:dataspaceSize()
 	    if not self._orig_data_length then self._orig_data_length = sz[1] end
 	    assert (sz[1] == self._orig_data_length, sz[1], self._orig_data_length)
 	    sz[1] = self.subsliceinds:sum()
@@ -77,6 +80,9 @@ function HDF5DataProvider:getNextBatch()
 	    slice[sind] = {1, slice[sind]}
 	end
         data[source] = self:getData(self.data[source], slice)
+	if self.postprocess and self.postprocess[source] then
+	    data[source] = self.postprocess[source](data[source], self.file)
+	end
     end
     self:incrementBatchNum()
     return data
@@ -214,16 +220,39 @@ function net.loadnet(filename)
     return N, rootnames, leafnames, G, steplist, stepspecs
 end
 
---[[
-function net.trainSGDMultiObjective()
-    -- set seed
-    -- load net from .t7 if given else from .ini
-    -- set epoch and batch from loaded model or else at 0
+
+function net.trainSGDMultiObjective(args)
+    --set seed
+    seed = args['random_seed']
+    torch.manualSeed(seed)
+
+    --load net and set epoch/batch
+    load_file = args['load_file']
+    load_query = args['load_query']
+    config_file = args['config_file']
+    if load_file then
+        netspec = torch.load(load_file)
+	net = netspec['net']
+	epoch = netspec['epoch']
+	batch_num = netspec['batch_num']
+    elseif load_query then
+        netspec = loadFromDatabase(load_query)
+	net = netspec['net']
+	epoch = netspec['epoch']
+	batch_num = netspec['batch_num']
+    else 
+	net = net.loadnet(config)
+	epoch = 0
+	batch_num = 0
+    end
+
     -- initialize data provider to batch_num
-    -- loop stepSGDMultiObjective for given number of numbers 
+    -- dpargs = 
+    
+    -- loop stepSGDMultiObjective for given number of steps
     -- save in specified way with specified frequency
 end
---]]
+
 
 function net.stepSGDMultiObjective(N, inputPatterns, outputPatterns, 
 	           		    stepspecs, prevs, momentum, learning_rate, 
