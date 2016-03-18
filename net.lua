@@ -11,24 +11,40 @@ local utils = require('pl.utils')
 local tablex = require('pl.tablex')
 
 --[[HDF5 todo:  
-    - debug: current code
     - add: subslice
 --]]
 
 HDF5DataProvider = torch.class('net.HDF5DataProvider')
-function HDF5DataProvider:__init(hdf5source, sourcelist, batch_size)
+function HDF5DataProvider:__init(hdf5source, sourcelist, batch_size, subslice)
     self.hdf5source = hdf5source
     self.sourcelist = sourcelist
-    --self.subslice = subslice
     self.file = hdf5.open(self.hdf5source, 'r')
+    self.subslice = subslice
     self.data = {}
     self.sizes = {}
     for sourceind=1,#sourcelist do
         source = sourcelist[sourceind]
     	self.data[source] = self.file:read(source)
-	self.sizes[source] = self.data[source]:dataspaceSize()
-	if not self.data_length then self.data_length = self.sizes[source][1] end
-	assert (self.sizes[source][1] == self.data_length, self.sizes[source], self.data_length)
+    end
+    for sourceind=1,#sourcelist do
+    	source = sourcelist[sourceind]
+        if not self.subslice then 
+    	    self.sizes[source] = self.data[source]:dataspaceSize()
+	else
+	    if not self.subsliceinds then
+	        self.subsliceinds = self.subslice(self.data, self.sourcelist)
+		ssnz = self.subsliceinds:nonzero()
+		ssnz = ssnz:reshape(torch.LongStorage({ssnz:size(1)}))
+		self.subsliceindsnz = ssnz
+	    end
+            sz = self.data[source]:dataspaceSize()
+	    if not self._orig_data_length then self._orig_data_length = sz[1] end
+	    assert (sz[1] == self._orig_data_length, sz[1], self._orig_data_length)
+	    sz[1] = self.subsliceinds:sum()
+	    self.sizes[source] = sz
+	end
+   	if not self.data_length then self.data_length = self.sizes[source][1] end
+	assert (self.sizes[source][1] == self.data_length, self.sizes[source][1], self.data_length)   
     end
     self.batch_size = batch_size
     self.total_batches = math.ceil(self.data_length / self.batch_size)
@@ -42,20 +58,20 @@ end
 
 
 function HDF5DataProvider:getNextBatch()
-    data = {}
-    cbn = self.curr_batch_num
-    startv = cbn * self.batch_size + 1
-    endv = math.min((cbn + 1) * self.batch_size, self.data_length)
+    local data = {}
+    local cbn = self.curr_batch_num
+    local startv = cbn * self.batch_size + 1
+    local endv = math.min((cbn + 1) * self.batch_size, self.data_length)
     sourcelist = self.sourcelist
     for sourceind=1,#sourcelist do 
-        source = sourcelist[sourceind]
-    	slice = tablex.deepcopy(self.sizes[source])
+        local source = sourcelist[sourceind]
+    	local slice = tablex.deepcopy(self.sizes[source])
 	table.remove(slice, 1)
         table.insert(slice, 1, {startv, endv})
 	for sind=2,#slice do
 	    slice[sind] = {1, slice[sind]}
 	end
-        data[source] = self.data[source]:partial(unpack(slice))
+        data[source] = self:getData(self.data[source], slice)
     end
     self:incrementBatchNum()
     return data
@@ -65,6 +81,41 @@ end
 function HDF5DataProvider:incrementBatchNum()
     m = self.total_batches
     self.curr_batch_num = (self.curr_batch_num + 1) % m
+end
+
+
+function HDF5DataProvider:getData(dsource, slice)
+    if not self.subslice then
+        return dsource:partial(unpack(slice))
+    else
+        local ssind = self.subsliceinds
+        local ssindnz = self.subsliceindsnz
+        local s1 = ssindnz[slice[1][1]]
+	local s2 = ssindnz[slice[1][2]]
+	local ssind0 = ssind[{{s1, s2}}]
+	local nss = math.ceil((s2 - s1 + 1) / self.batch_size)
+	local datalist = {}
+	local batch_size = self.batch_size
+	for j=1,nss do
+       	    local startv = s1 + batch_size * (j-1)
+	    local endv = math.min(s1 + batch_size * j - 1, self._orig_data_length)
+	    local newslice = tablex.deepcopy(slice)
+	    newslice[1] = {startv, endv}
+	    local data = dsource:partial(unpack(newslice))
+	    startv = batch_size * (j-1) + 1
+	    endv = math.min(ssind0:size()[1], batch_size * j)
+	    dataind = ssind0[{{batch_size * (j-1) + 1, endv}}]:nonzero()
+	    dataind = dataind:reshape(torch.LongStorage({dataind:size()[1]}))
+	    datalist[j] = data:index(1, dataind)
+	end
+        if (nss > 1) then
+    	    datalist[#datalist + 1] = 1
+	    data = torch.cat(unpack(datalist))
+        else
+            data = datalist[1]
+        end
+        return data
+    end
 end
 
 
