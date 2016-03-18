@@ -32,7 +32,12 @@ function HDF5DataProvider:__init(hdf5source, sourcelist, batch_size, subslice)
     	    self.sizes[source] = self.data[source]:dataspaceSize()
 	else
 	    if not self.subsliceinds then
-	        self.subsliceinds = self.subslice(self.data, self.sourcelist)
+	        if type(self.subslice) == 'function' then
+    	            self.subsliceinds = self.subslice(self.data, self.sourcelist)
+		else
+		    assert(type(self.subslice) == 'string')
+		    self.subsliceinds = self.file:read(self.subslice):all()
+		end
 		ssnz = self.subsliceinds:nonzero()
 		ssnz = ssnz:reshape(torch.LongStorage({ssnz:size(1)}))
 		self.subsliceindsnz = ssnz
