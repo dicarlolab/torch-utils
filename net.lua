@@ -5,11 +5,34 @@ net = {}
 
 require('graph')
 require('nngraph')
+require('sha1')
 require('hdf5')
 local config = require('pl.config')
 local utils = require('pl.utils')
 local tablex = require('pl.tablex')
+local torch = require('torch')
 
+function flatten()
+    F = function (x) 
+        local shp = x:size()
+        local sz = 1
+        for i=2,#shp do
+	    sz = shp[i] * sz
+	end
+        x = x:reshape(shp[1], sz)
+        return torch.DoubleTensor(x:size()):copy(x)
+    end
+    return F
+end
+
+function typer()
+    F = function(x)
+        return torch.DoubleTensor(x:size()):copy(x)
+    end
+    return F	
+end
+
+net.POSTPROCESSOR_REGISTRY = {flatten=flatten, typer=typer}
 
 HDF5DataProvider = torch.class('net.HDF5DataProvider')
 function HDF5DataProvider:__init(args)
@@ -57,11 +80,13 @@ function HDF5DataProvider:__init(args)
     self.batch_size = batch_size
     self.total_batches = math.ceil(self.data_length / self.batch_size)
     self.curr_batch_num = 0
+    self.curr_epoch = 1
 end
 
 
-function HDF5DataProvider:setBatchNum(n)
-    self.curr_batch_num = n
+function HDF5DataProvider:setEpochBatch(epoch, batch_num)
+    self.curr_epoch = epoch
+    self.curr_batch_num = batch_num
 end
 
 
@@ -91,7 +116,11 @@ end
 
 function HDF5DataProvider:incrementBatchNum()
     m = self.total_batches
+    if (self.curr_batch_num >= m) then
+        self.curr_epoch = self.curr_epoch + 1
+    end
     self.curr_batch_num = (self.curr_batch_num + 1) % m
+    
 end
 
 
@@ -227,41 +256,198 @@ function net.trainSGDMultiObjective(args)
     torch.manualSeed(seed)
 
     --load net and set epoch/batch
-    load_file = args['load_file']
-    load_query = args['load_query']
-    config_file = args['config_file']
+    local load_file = args['load_file']
+    local load_query = args['load_query']
+    local config_file = args['config_file']
+    local netspec, epoch0, batch_num0, N, rootnames, leafnames, netGraph, steplist, stepspecs, prevs
     if load_file then
-        netspec = torch.load(load_file)
-	net = netspec['net']
-	epoch = netspec['epoch']
-	batch_num = netspec['batch_num']
+        local netspec = torch.load(load_file)
+	N = netspec['net']
+	rootnames = netspec['rootnames']
+	leafnames = netspec['leafnames']
+	stepspecs = netspec['stepspecs']
+	prevs = netspec['prevs']
+	epoch0 = netspec['epoch']
+	batch_num0 = netspec['batch_num']
     elseif load_query then
         netspec = loadFromDatabase(load_query)
-	net = netspec['net']
-	epoch = netspec['epoch']
-	batch_num = netspec['batch_num']
+	N = netspec['net']
+	rootnames = netspec['rootnames']
+	leafnames = netspec['leafnames']
+	stepspecs = netspec['stepspecs']
+	prevs = netspec['prevs']
+	epoch0 = netspec['epoch']
+	batch_num0 = netspec['batch_num']
     else 
-	net = net.loadnet(config)
-	epoch = 0
-	batch_num = 0
+        N, rootnames, leafnames, netGraph, steplist, stepspecs = net.loadnet(config_file)
+	netspec = {}
+	epoch0 = 0
+	batch_num0 = 0
+	prevs = {}
+    end
+    --initialize experiment_data
+    if args['experiment_data'] then experiment_data = args['experiment_data'] else experiment_data = netspec['experiment_data'] end
+
+    --initialize data providers
+    local dp_args, outputPatterns
+    if args['epoch0'] then epoch0 = args['epoch0'] end
+    if args['batch_num0'] then batch_num0 = args['batch_num0'] end
+    if args['dp_params'] then dp_args = args['dp_params'] else dp_args = netspec['dp_params'] end
+    if args['outputPatterns'] then outputPatterns = args['outputPatterns'] else outputPatterns = netspec['outputPatterns'] end
+    assert (#outputPatterns == #dp_args)
+    local inputPatterns={}, data_length, dp
+    for dpind=1,#dp_args do
+    	local dp_arg = dp_args[dpind]
+	assert (#dp_arg['sourcelist'] == #rootnames)
+        dp_arg1 = process_dp_arg(dp_arg)
+	dp = net.HDF5DataProvider(dp_arg1)
+	dp:setEpochBatch(epoch0, batch_num0)
+	inputPatterns[dpind] = dp
+	if not data_length then data_length = dp.data_length end
+	assert (data_length == dp.data_length)
+	assert ((#leafnames==1) or (#outputPatterns[dpind] == #leafnames))
     end
 
-    -- initialize data provider to batch_num
-    -- dpargs = 
-    
     -- loop stepSGDMultiObjective for given number of steps
-    -- save in specified way with specified frequency
+    local num_batches = args['num_batches']
+    local weight_decay, learning_rate_params, momentum_params
+    if args['weight_decay'] then weight_decay = args['weight_decay'] else weight_decay = netspec['weight_decay'] end
+    if args['learning_rate_params'] then 
+        learning_rate_params = args['learning_rate_params']
+    else
+        learning_rate_params = netspec['learning_rate_params']
+    end
+    if args['momentum_params'] then 
+        momentum_params = args['momentum_params']
+    else
+        momentum_params = netspec['momentum_params']
+    end
+    local epoch = epoch0
+    local batch_num = batch_num0
+    local save, momentum, save_filters, save_args, rec, save_freq
+    if args['save_freq'] then
+        save_freq = args['save_freq']
+    else 
+        save_freq = netspec['save_freq']
+    end
+    for _stepind=1,num_batches do
+    	learning_rate = get_learning_rate(learning_rate_params, epoch, batch_num)
+        momentum = get_momentum(momentum_params, epoch, batch_num, learning_rate)
+        net.stepSGDMultiObjective(N, inputPatterns, outputPatterns,
+				  stepspecs, prevs,
+				  momentum, learning_rate, weight_decay, rootnames)
+        epoch = inputPatterns[1].curr_epoch
+	batch_num = inputPatterns[1].curr_batch_num
+	assert (batch_num == (_stepind + batch_num0) % data_length)
+	-- print performance
+
+        -- save in specified way with specified frequency	
+	save =  (batch_num % save_freq  == 0) 
+	save_filters = (batch_num % (save_freq * write_freq) == 0)
+	if save then
+	    -- add performance data    
+	    save_args = {experiment_data=experiment_data, 
+	                prevs=prevs, epoch=epoch, batch_num=batch_num,
+	   	        dp_params=dp_params, outputPatterns=outputPatterns,
+			momentum_params=momentum_params, learning_rate_params=learning_rate_params, 
+			weight_decay=weight_decay, rootnames=rootnames, leafnames=leafnames, stepspecs=stepspecs}
+	    rec = saveMongoRec(N, save_args, args['save_host'], args['save_port'], args['db_name'], args['collection_name'], save_filters)
+	end
+    end
+
 end
 
+
+function process_dp_arg(dp_arg)
+    local dp_arg1 = tablex.deepcopy(dp_arg)
+    local processor_name, processor_args, processor_factory, processor
+    if dp_arg1['postprocess'] then
+        for source, pargs in pairs(dp_arg1['postprocess']) do
+            processor_name, processor_args = unpack(pargs)
+            processor_factory = net.POSTPROCESSOR_REGISTRY[processor_name]
+            processor = processor_factory(processor_args)
+	    dp_arg1['postprocess'][source] = processor
+        end 
+    end
+    return dp_arg1
+end
+
+
+function loadFromDatabase(query)
+    local host = query['host']
+    local port = query['port']
+    local dbname = query['dbname']
+    local colname = query['collection_name'] + '.files'
+    local fsname = query['collection_name']
+    local query = tablex.deepcopy(query['query'])
+    query["saved_filters"] = true 
+    local qspec = {query=query, ordered={timestamp=-1}}
+    if not db then
+        db = mongo.Connection.New()
+        db:connect(host .. ':' .. port)
+	fs = mongo.GridFS.New(db, dbname, fsname)
+    end
+    local r = db:query(dbname .. '.' .. colname, qspec):next()
+    local f = fs:find_file({_id=r["_id"]})
+    local fstr = ''
+    for cind=1,f:num_chunks() do
+        fstr = fstr .. f:chunk(cind-1)
+    end
+    r["net"] = torch.deserialize(fstr, "ascii")
+end
+
+function saveMongoRec(N, save_args, save_filters, host, port, dbname, fsname, save_filters)
+    local now = os.time()
+    save_args = tablex.deepcopy(save_args)
+    save_args['timestamp'] = now
+    if not db then
+        db = mongo.Connection.New()
+        db:connect(host .. ':' .. port)
+	fs = mongo.GridFS.New(db, dbname, colname)
+    end
+    if not fsbuilder then
+        fsbuilder = mongo.GridFileBuilder.New(fs)
+    end
+    local fsbuilder
+    if save_filters then
+        fsbuilder:append(torch.serialize(N, "ascii"))
+	save_args['saved_filters'] = true
+    else
+	fsbuilder:append(torch.serialize(nil, "ascii"))
+    end
+    local fname = sha1(torch.serialize(save_args))
+    fsbuilder:build(fname)
+    local update = {}
+    update['$set'] = save_args
+    db:update(dbname .. '.' .. colname .. '.files', {filename=fname}, update, false, false)
+        
+end
+
+function get_learning_rate(lr_params, epoch, batch_num)
+    return lr_params['base_learning_rate']
+end
+
+function get_momentum(momentum_params, epoch, batch_num, learning_rate)
+    if momentum_params['base_momentum'] then
+        return momentum_params['base_momentum'] 
+    else
+	return 0
+    end
+end
 
 function net.stepSGDMultiObjective(N, inputPatterns, outputPatterns, 
 	           		    stepspecs, prevs, momentum, learning_rate, 
 				    weight_decay)
     --inputPatterns = table of data providers returning object suitable for network intput
     --outputPatterns = table of outputGrad (tables of tensors or single tensors)
+    local sourcelist
     for j=1,#inputPatterns do
         if not prevs[j] then prevs[j] = {} end
-	inputs = inputPatterns[j]: getNextBatch()
+	inputs1 = inputPatterns[j]:getNextBatch()
+	sourcelist = inputPatterns[j].sourcelist
+	for iind=1,#sourcelist do
+	    inputs[iind] = inputs1[sourcelist[iind]]
+	end
 	outputGrads = outputPatterns[j]
 	net.sgdstep(N, inputs, outputGrads, stepspecs, prevs[j], momentum, learning_rate, weight_decay)
     end
@@ -269,13 +455,14 @@ end
 
 
 function net.sgdstep(N, inputs, outputGrads, stepspecs, prevs, momentum, learning_rate, weight_decay)
-    t0 = os.clock()
-    N:forward(inputs)
+    local t0 = os.clock()
+    print(N:forward(inputs))
     N:zeroGradParameters()
     N:backward(inputs, outputGrads)
-    t1 = os.clock()
+    local t1 = os.clock()
     --print('t1', t1-t0)
-    nodes = N.fg.nodes
+    local nodes = N.fg.nodes
+    local node, module, spec, lr, wd, lrmult, wdmult, diff, change
     for nind=1,#nodes do
     	node = nodes[nind]
         module = node.data.module
