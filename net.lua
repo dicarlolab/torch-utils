@@ -7,8 +7,9 @@ net = {}
 require('graph')
 --the best nn library in torch, this is an extension of 'nn' by Nando DeFreitas 
 require('nngraph')
-require('sha1')
+sha1 = require('sha1')
 require('hdf5')
+require('mongo')
 -- pl is "penlight" which is a utilies library framework for lua 
 local config = require('pl.config')   -- read INI config files 
 local utils = require('pl.utils')     
@@ -121,7 +122,7 @@ end
 
 function HDF5DataProvider:incrementBatchNum()
     m = self.total_batches
-    if (self.curr_batch_num >= m) then
+    if (self.curr_batch_num >= m-1) then
         self.curr_epoch = self.curr_epoch + 1
     end
     self.curr_batch_num = (self.curr_batch_num + 1) % m
@@ -290,11 +291,11 @@ function net.trainSGDMultiObjective(args)
 	batch_num0 = netspec['batch_num']
     elseif load_query then
         netspec = loadFromDatabase(load_query)
-	N = netspec['net']
+	N = netspec['_saved_state']['net']
+	prevs = netspec['_saved_state']['prevs']
 	rootnames = netspec['rootnames']
 	leafnames = netspec['leafnames']
 	stepspecs = netspec['stepspecs']
-	prevs = netspec['prevs']
 	epoch0 = netspec['epoch']
 	batch_num0 = netspec['batch_num']
     else 
@@ -314,7 +315,7 @@ function net.trainSGDMultiObjective(args)
     if args['dp_params'] then dp_args = args['dp_params'] else dp_args = netspec['dp_params'] end
     if args['outputPatterns'] then outputPatterns = args['outputPatterns'] else outputPatterns = netspec['outputPatterns'] end
     assert (#outputPatterns == #dp_args)
-    local inputPatterns={}, data_length, dp
+    local inputPatterns={}, data_length, dp, total_batches
     for dpind=1,#dp_args do
     	local dp_arg = dp_args[dpind]
 	assert (#dp_arg['sourcelist'] == #rootnames)
@@ -323,6 +324,7 @@ function net.trainSGDMultiObjective(args)
 	dp:setEpochBatch(epoch0, batch_num0)
 	inputPatterns[dpind] = dp
 	if not data_length then data_length = dp.data_length end
+	if not total_batches then total_batches = dp.total_batches end
 	assert (data_length == dp.data_length)
 	assert ((#leafnames==1) or (#outputPatterns[dpind] == #leafnames))
     end
@@ -349,6 +351,11 @@ function net.trainSGDMultiObjective(args)
     else 
         save_freq = netspec['save_freq']
     end
+    if args['write_freq'] then
+        write_freq = args['write_freq']
+    else 
+        write_freq = netspec['write_freq']
+    end
     for _stepind=1,num_batches do
     	learning_rate = get_learning_rate(learning_rate_params, epoch, batch_num)
         momentum = get_momentum(momentum_params, epoch, batch_num, learning_rate)
@@ -357,23 +364,24 @@ function net.trainSGDMultiObjective(args)
 				  momentum, learning_rate, weight_decay, rootnames)
         epoch = inputPatterns[1].curr_epoch
 	batch_num = inputPatterns[1].curr_batch_num
-	assert (batch_num == (_stepind + batch_num0) % data_length)
+	assert (batch_num == (_stepind + batch_num0) % total_batches)
 	-- print performance
-
+	print('e/b', epoch, batch_num)
         -- save in specified way with specified frequency	
-	save =  (batch_num % save_freq  == 0) 
-	save_filters = (batch_num % (save_freq * write_freq) == 0)
+	save =  (_stepind % save_freq  == 0) 
+	save_filters = (_stepind % (save_freq * write_freq) == 0)
 	if save then
 	    -- add performance data    
 	    save_args = {experiment_data=experiment_data, 
-	                prevs=prevs, epoch=epoch, batch_num=batch_num,
+	                epoch=epoch, batch_num=batch_num,
 	   	        dp_params=dp_params, outputPatterns=outputPatterns,
 			momentum_params=momentum_params, learning_rate_params=learning_rate_params, 
-			weight_decay=weight_decay, rootnames=rootnames, leafnames=leafnames, stepspecs=stepspecs}
-	    rec = saveMongoRec(N, save_args, args['save_host'], args['save_port'], args['db_name'], args['collection_name'], save_filters)
+			weight_decay=weight_decay, rootnames=rootnames, leafnames=leafnames, stepspecs=stepspecs,
+			save_freq=save_freq, write_freq=write_freq}
+	    rec = saveMongoRec(N, prevs, save_args, args['save_host'], args['save_port'], args['db_name'], args['collection_name'], save_filters)
 	end
     end
-
+    
 end
 
 
@@ -412,33 +420,40 @@ function loadFromDatabase(query)
     for cind=1,f:num_chunks() do
         fstr = fstr .. f:chunk(cind-1)
     end
-    r["net"] = torch.deserialize(fstr, "ascii")
+    r["_saved_state"] = torch.deserialize(fstr, "ascii")
 end
 
-function saveMongoRec(N, save_args, save_filters, host, port, dbname, fsname, save_filters)
+function saveMongoRec(N, prevs, save_args, host, port, dbname, fsname, save_filters)
     local now = os.time()
     save_args = tablex.deepcopy(save_args)
     save_args['timestamp'] = now
     if not db then
         db = mongo.Connection.New()
         db:connect(host .. ':' .. port)
-	fs = mongo.GridFS.New(db, dbname, colname)
+	fs = mongo.GridFS.New(db, dbname, fsname)
     end
+    local fsbuilder
     if not fsbuilder then
         fsbuilder = mongo.GridFileBuilder.New(fs)
     end
-    local fsbuilder
+    print('Serializing model and previous diffs ... ')
     if save_filters then
-        fsbuilder:append(torch.serialize(N, "ascii"))
+        fsbuilder:append(torch.serialize({net=N, prevs=prevs}, "ascii"))
 	save_args['saved_filters'] = true
     else
 	fsbuilder:append(torch.serialize(nil, "ascii"))
     end
-    local fname = sha1(torch.serialize(save_args))
+    local sastr = torch.serialize(save_args, "ascii")
+    print('Creating model filename ... ')
+    local fname = sha1(sastr)
+    print('... ' .. fname)
+    print('building file... ')
     fsbuilder:build(fname)
     local update = {}
     update['$set'] = save_args
-    db:update(dbname .. '.' .. colname .. '.files', {filename=fname}, update, false, false)
+    print('updating record')
+    db:update(dbname .. '.' .. fsname .. '.files', {filename=fname}, update, false, false)
+    print('done saving')
         
 end
 
