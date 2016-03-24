@@ -3,14 +3,16 @@ require 'os'
 
 net = {}
 
+--graph library for manipulating network structure (like python's networkx but worse)
 require('graph')
+--the best nn library in torch, this is an extension of 'nn' by Nando DeFreitas 
 require('nngraph')
 require('sha1')
 require('hdf5')
-local config = require('pl.config')
-local utils = require('pl.utils')
-local tablex = require('pl.tablex')
-local torch = require('torch')
+-- pl is "penlight" which is a utilies library framework for lua 
+local config = require('pl.config')   -- read INI config files 
+local utils = require('pl.utils')     
+local tablex = require('pl.tablex')   
 
 function flatten()
     F = function (x) 
@@ -32,8 +34,11 @@ function typer()
     return F	
 end
 
+--using "registry" pattern for postprocessor for data loading 
+--(in DLDataProvider2, this is unnecessary since postprocessors can be implemented in the dataset object itself)
 net.POSTPROCESSOR_REGISTRY = {flatten=flatten, typer=typer}
 
+--data provider equivalent
 HDF5DataProvider = torch.class('net.HDF5DataProvider')
 function HDF5DataProvider:__init(args)
     hdf5source = args['hdf5source']
@@ -170,7 +175,20 @@ function getnode(G, x)
     return graph.Node.new(x)
 end
 
+--function for loading a network from INI config file
 function net.loadnet(filename)
+    --[[
+       input 
+       	     filename = path of .ini config file
+       returns 
+       	       N = network
+	       rootnames = names of input nodes in proper order, e.g {datain, labelin} 
+	       leafnames = names of output nodes in proper order, e.g. {loss1, loss2}
+	       G = graph object describing network
+	       steplist = not important
+	       stepspecs = list of loaded up per-layer specific description in lua table format
+
+    --]]
     stepspecs = config.read(filename)
     G = graph.Graph()
     steplist = {}
@@ -250,6 +268,7 @@ function net.loadnet(filename)
 end
 
 
+-- loads, initializes, trains, and saves network (to database)
 function net.trainSGDMultiObjective(args)
     --set seed
     seed = args['random_seed']
