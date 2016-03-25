@@ -1,6 +1,12 @@
 require 'torch'
 require 'os'
 
+--[[
+TODO:
+	* actually perform testing of actual sgd training results in train
+	* gpu selection specification
+--]]
+
 net = {}
 
 --graph library for manipulating network structure (like python's networkx but worse)
@@ -10,6 +16,7 @@ require('nngraph')
 sha1 = require('sha1')
 require('hdf5')
 require('mongo')
+require('pprint')
 -- pl is "penlight" which is a utilies library framework for lua 
 local config = require('pl.config')   -- read INI config files 
 local utils = require('pl.utils')     
@@ -97,8 +104,14 @@ end
 
 
 function HDF5DataProvider:getNextBatch()
+    local data = self:getBatch(self.curr_batch_num)
+    self:incrementBatchNum()
+    return data
+end
+
+
+function HDF5DataProvider:getBatch(cbn)
     local data = {}
-    local cbn = self.curr_batch_num
     local startv = cbn * self.batch_size + 1
     local endv = math.min((cbn + 1) * self.batch_size, self.data_length)
     sourcelist = self.sourcelist
@@ -115,10 +128,8 @@ function HDF5DataProvider:getNextBatch()
 	    data[source] = self.postprocess[source](data[source], self.file)
 	end
     end
-    self:incrementBatchNum()
     return data
 end
-
 
 function HDF5DataProvider:incrementBatchNum()
     m = self.total_batches
@@ -190,9 +201,9 @@ function net.loadnet(filename)
 	       stepspecs = list of loaded up per-layer specific description in lua table format
 
     --]]
-    stepspecs = config.read(filename)
-    G = graph.Graph()
-    steplist = {}
+    local stepspecs = config.read(filename)
+    local G = graph.Graph()
+    local nodek, opname, inlist, inputs, inp, inpnode, e
     for k, v in pairs(stepspecs) do
         nodek = getnode(G, k)
 	opname = v['op']
@@ -210,14 +221,15 @@ function net.loadnet(filename)
 	    end
 	end
     end
-    nodes = G:topsort()
-    steplist = {}
+    local nodes = G:topsort()
+    local steplist = {}
     for nind=1,#nodes do
-    	node = nodes[nind]
-        nname = node.data
-	v = stepspecs[nname]
-	args = v['args']
-	opname = v['op']
+    	local node = nodes[nind]
+        local nname = node.data
+	local v = stepspecs[nname]
+	local args = v['args']
+	local opname = v['op']
+	local op
 	if args then
 	    if type(args) == 'table' then
      	        op = nn[opname](unpack(args))
@@ -227,7 +239,7 @@ function net.loadnet(filename)
 	else
 	    op = nn[opname]()
 	end
-	initW = v['initW']
+	local initW = v['initW']
         if initW then
             op.weight = torch.mul(op.weight, initW)
         end
@@ -250,16 +262,16 @@ function net.loadnet(filename)
 	step:annotate{name=nname}
 	steplist[nname] = step
     end
-    roots = G:roots()
-    rootnodes = {}
-    rootnames = {}
+    local roots = G:roots()
+    local rootnodes = {}
+    local rootnames = {}
     for rind=1,#roots do
     	rootnames[#rootnames + 1] = roots[rind].data
         rootnodes[#rootnodes + 1] = steplist[roots[rind].data]
     end
-    leaves = G:leaves()
-    leafnodes = {}
-    leafnames= {}
+    local leaves = G:leaves()
+    local leafnodes = {}
+    local leafnames= {}
     for lind=1,#leaves do
     	leafnames[#leafnames + 1] = leaves[lind].data
         leafnodes[#leafnodes + 1] = steplist[leaves[lind].data]
@@ -315,9 +327,9 @@ function net.trainSGDMultiObjective(args)
     if args['dp_params'] then dp_args = args['dp_params'] else dp_args = netspec['dp_params'] end
     if args['outputPatterns'] then outputPatterns = args['outputPatterns'] else outputPatterns = netspec['outputPatterns'] end
     assert (#outputPatterns == #dp_args)
-    local inputPatterns={}, data_length, dp, total_batches
+    local inputPatterns={}, data_length, dp, total_batches, dp_arg, dp_arg1
     for dpind=1,#dp_args do
-    	local dp_arg = dp_args[dpind]
+    	dp_arg = dp_args[dpind]
 	assert (#dp_arg['sourcelist'] == #rootnames)
         dp_arg1 = process_dp_arg(dp_arg)
 	dp = net.HDF5DataProvider(dp_arg1)
@@ -327,6 +339,24 @@ function net.trainSGDMultiObjective(args)
 	if not total_batches then total_batches = dp.total_batches end
 	assert (data_length == dp.data_length)
 	assert ((#leafnames==1) or (#outputPatterns[dpind] == #leafnames))
+    end
+
+    local dp_test_args
+    if args['dp_test_params'] then dp_test_args = args['dp_test_params'] else dp_test_args = netspec['dp_test_params'] end
+    local testPatterns
+    if dp_test_args then
+       testPatterns = {}
+        for dpind=1,#dp_test_args do
+    	    dp_arg = dp_test_args[dpind]
+    	    assert (#dp_arg['sourcelist'] == #rootnames)
+            dp_arg1 = process_dp_arg(dp_arg)
+	    dp = net.HDF5DataProvider(dp_arg1)
+   	    testPatterns[dpind] = dp
+	    if not data_length then data_length = dp.data_length end
+	    if not total_batches then total_batches = dp.total_batches end
+	    assert (data_length == dp.data_length)
+	    assert ((#leafnames==1) or (#outputPatterns[dpind] == #leafnames))
+        end
     end
 
     -- loop stepSGDMultiObjective for given number of steps
@@ -359,25 +389,31 @@ function net.trainSGDMultiObjective(args)
     for _stepind=1,num_batches do
     	learning_rate = get_learning_rate(learning_rate_params, epoch, batch_num)
         momentum = get_momentum(momentum_params, epoch, batch_num, learning_rate)
-        net.stepSGDMultiObjective(N, inputPatterns, outputPatterns,
+        local perfs = net.stepSGDMultiObjective(N, inputPatterns, outputPatterns,
 				  stepspecs, prevs,
-				  momentum, learning_rate, weight_decay, rootnames)
+				  momentum, learning_rate, weight_decay, leafnames)
         epoch = inputPatterns[1].curr_epoch
 	batch_num = inputPatterns[1].curr_batch_num
 	assert (batch_num == (_stepind + batch_num0) % total_batches)
-	-- print performance
-	print('e/b', epoch, batch_num)
+	print('epoch: ' .. epoch .. ' batch_num: ' .. batch_num)
+	pprint(perfs)
         -- save in specified way with specified frequency	
 	save =  (_stepind % save_freq  == 0) 
 	save_filters = (_stepind % (save_freq * write_freq) == 0)
 	if save then
-	    -- add performance data    
+	    -- evaluate test performance
+	    local test_perfs
+	    if dp_test_args then
+	       test_perfs = net.stepSGDMultiObjectiveTest(N, testPatterns, dp_test_args, leafnames)
+	    end	    
 	    save_args = {experiment_data=experiment_data, 
 	                epoch=epoch, batch_num=batch_num,
-	   	        dp_params=dp_params, outputPatterns=outputPatterns,
+	   	        dp_params=dp_args, dp_test_params=dp_test_args, 
+			outputPatterns=outputPatterns,
 			momentum_params=momentum_params, learning_rate_params=learning_rate_params, 
 			weight_decay=weight_decay, rootnames=rootnames, leafnames=leafnames, stepspecs=stepspecs,
-			save_freq=save_freq, write_freq=write_freq}
+			save_freq=save_freq, write_freq=write_freq, train_performance=perfs, 
+			test_performance=test_perfs}
 	    rec = saveMongoRec(N, prevs, save_args, args['save_host'], args['save_port'], args['db_name'], args['collection_name'], save_filters)
 	end
     end
@@ -425,8 +461,9 @@ end
 
 function saveMongoRec(N, prevs, save_args, host, port, dbname, fsname, save_filters)
     local now = os.time()
-    save_args = tablex.deepcopy(save_args)
+    --save_args = tablex.deepcopy(save_args)
     save_args['timestamp'] = now
+    save_args = net.SONify(save_args)
     if not db then
         db = mongo.Connection.New()
         db:connect(host .. ':' .. port)
@@ -469,28 +506,90 @@ function get_momentum(momentum_params, epoch, batch_num, learning_rate)
     end
 end
 
-function net.stepSGDMultiObjective(N, inputPatterns, outputPatterns, 
-	           		    stepspecs, prevs, momentum, learning_rate, 
-				    weight_decay)
-    --inputPatterns = table of data providers returning object suitable for network intput
-    --outputPatterns = table of outputGrad (tables of tensors or single tensors)
-    local sourcelist
-    for j=1,#inputPatterns do
-        if not prevs[j] then prevs[j] = {} end
-	inputs1 = inputPatterns[j]:getNextBatch()
-	sourcelist = inputPatterns[j].sourcelist
-	for iind=1,#sourcelist do
+function format_batch_correctly(inputs1, sourcelist)
+    local inputs
+    if #sourcelist == 1 then
+	inputs = inputs1[sourcelist[1]]
+    else
+        inputs = {}
+    	for iind=1,#sourcelist do
 	    inputs[iind] = inputs1[sourcelist[iind]]
-	end
-	outputGrads = outputPatterns[j]
-	net.sgdstep(N, inputs, outputGrads, stepspecs, prevs[j], momentum, learning_rate, weight_decay)
+ 	end
     end
+    return inputs
+end
+
+function format_performance_correctly(perfs, leafnames)
+    local perfdict = {}
+    if #leafnames == 1 then
+        perfdict[leafnames[1]] = perfs
+    else
+        assert (#leafnames == #perfs)
+	for i=1,#leafnames do
+	    perfdict[leafnames[i]] = perfs[i]
+	end
+    end
+    return perfdict
 end
 
 
+function net.stepSGDMultiObjective(N, inputPatterns, outputPatterns, 
+	           		   stepspecs, prevs, 
+				   momentum, learning_rate, weight_decay,
+				   leafnames)
+    --inputPatterns = table of data providers returning object suitable for network input
+    --outputPatterns = table of outputGrad (tables of tensors or single tensors)
+    local sourcelist, inputs
+    local perfs = {}
+    for j=1,#inputPatterns do
+    	inputs = {}
+        if not prevs[j] then prevs[j] = {} end
+	inputs = format_batch_correctly(inputPatterns[j]:getNextBatch(),
+	       	                        inputPatterns[j].sourcelist)
+	outputGrads = outputPatterns[j]
+	perfs[j] = net.sgdstep(N, inputs, outputGrads, 
+		   	      stepspecs, prevs[j], 
+			      momentum, learning_rate, weight_decay)
+	perfs[j] = format_performance_correctly(perfs[j], leafnames)
+    end
+    return perfs
+end
+
+
+function aggregate_performance(perf)
+    loss_dict = {}
+    for bind=1,#perf do
+        for loss_name, loss_val in pairs(perf[bind]) do
+       	    if not loss_dict[loss_name] then loss_dict[loss_name] = 0 end
+ 	    loss_dict[loss_name] = loss_val * (1./bind) + loss_dict[loss_name] * ((bind - 1.) / bind)
+        end
+    end
+    return loss_dict
+end
+
+
+function net.stepSGDMultiObjectiveTest(N, testPatterns, testArgs, leafnames)
+    local sourcelist, inputs, batch_range, perf
+    local perfs = {}
+    for j=1,#testPatterns do
+    	perf = {}
+    	bstart, bend = unpack(testArgs[j]['batch_range'])
+	local ebatch = 1
+	for batch_num=bstart, bend do
+	    inputs = format_batch_correctly(testPatterns[j]:getBatch(batch_num),
+					    testPatterns[j].sourcelist)
+	    perf[ebatch] = format_performance_correctly(N:forward(inputs), leafnames)
+	    ebatch = ebatch + 1
+	end
+	--aggregate 
+	perfs[j] = aggregate_performance(perf)
+    end
+    return perfs
+end
+
 function net.sgdstep(N, inputs, outputGrads, stepspecs, prevs, momentum, learning_rate, weight_decay)
     local t0 = os.clock()
-    print(N:forward(inputs))
+    local perf = N:forward(inputs)
     N:zeroGradParameters()
     N:backward(inputs, outputGrads)
     local t1 = os.clock()
@@ -548,6 +647,28 @@ function net.sgdstep(N, inputs, outputGrads, stepspecs, prevs, momentum, learnin
     end
     t2 = os.clock()
     --print('t2', t2 - t1)
+    return perf
+end
+
+
+function net.SONify(arg)
+    if type(arg) == 'table' then
+        local sonarg = {}
+        for k, v in pairs(arg) do
+            sonarg[k] = net.SONify(v)
+        end
+	return sonarg
+    elseif type(arg) == 'number' then
+        return arg    
+    else
+	local m = arg.__metatable
+	if m and type(m) == 'table' and m['__typename'] and string.find(m['__typename'], 'Tensor') then
+	    return arg:totable()
+	else 
+            return arg
+	end
+    end
+    
 end
 
 
